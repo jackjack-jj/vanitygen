@@ -106,6 +106,7 @@ extern void vg_output_match(vg_context_t *vcp, EC_KEY *pkey,
 			    const char *pattern);
 extern void vg_encode_address(EC_KEY *pkey, int addrtype, char *result);
 extern void vg_encode_privkey(EC_KEY *pkey, int addrtype, char *result);
+extern void vg_seckey(EC_KEY *pkey, int addrtype, unsigned char *result);
 
 
 

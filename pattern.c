@@ -129,6 +129,25 @@ vg_encode_privkey(EC_KEY *pkey, int addrtype, char *result)
 	encode_b58_check(eckey_buf, nbytes + 1, result);
 }
 
+void
+vg_seckey(EC_KEY *pkey, int addrtype, unsigned char *result)
+{
+	unsigned char eckey_buf[128];
+	const BIGNUM *bn;
+	int nbytes;
+	size_t i;
+
+	bn = EC_KEY_get0_private_key(pkey);
+
+	eckey_buf[0] = addrtype;
+	nbytes = BN_bn2bin(bn, &eckey_buf[0]);
+
+	for (i = 0; i < nbytes * 2; i++)
+		result[i]="0123456789abcdef"[i%2?eckey_buf[i/2]%16:eckey_buf[i/2]/16];
+	result[i]='\0';
+
+}
+
 
 void
 dumphex(const unsigned char *src, size_t len)
@@ -427,11 +446,13 @@ vg_output_match(vg_context_t *vcp, EC_KEY *pkey, const char *pattern)
 	unsigned char key_buf[512], *pend;
 	char addr_buf[64];
 	char privkey_buf[128];
+	unsigned char seckey_buf[65];
 	int len;
 
 	assert(EC_KEY_check_key(pkey));
 	vg_encode_address(pkey, vcp->vc_addrtype, addr_buf);
 	vg_encode_privkey(pkey, vcp->vc_privtype, privkey_buf);
+	vg_seckey(pkey, vcp->vc_privtype, seckey_buf);
 
 	if (!vcp->vc_result_file || (vcp->vc_verbose > 0)) {
 		printf("\r%79s\rPattern: %s\n", "", pattern);
@@ -454,8 +475,9 @@ vg_output_match(vg_context_t *vcp, EC_KEY *pkey, const char *pattern)
 
 	if (!vcp->vc_result_file || (vcp->vc_verbose > 0)) {
 		printf("Address: %s\n"
-		       "Privkey: %s\n",
-		       addr_buf, privkey_buf);
+		       "Privkey: %s\n"
+		       "Secrkey: %s\n",
+		       addr_buf, privkey_buf, seckey_buf);
 	}
 
 	if (vcp->vc_result_file) {
@@ -467,8 +489,9 @@ vg_output_match(vg_context_t *vcp, EC_KEY *pkey, const char *pattern)
 			fprintf(fp,
 				"Pattern: %s\n"
 				"Address: %s\n"
-				"Privkey: %s\n",
-				pattern, addr_buf, privkey_buf);
+				"Privkey: %s\n"
+				"Secrkey: %s\n",
+				pattern, addr_buf, privkey_buf, seckey_buf);
 			fclose(fp);
 		}
 	}
