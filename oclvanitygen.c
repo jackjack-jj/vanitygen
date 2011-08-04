@@ -40,7 +40,7 @@
 #include "pattern.h"
 
 
-const char *version = "0.15";
+const char *version = "0.16";
 const int debug = 0;
 
 #define MAX_SLOT 2
@@ -63,6 +63,7 @@ typedef struct _vg_ocl_context_s {
 	vg_ocl_init_t			voc_init_func;
 	vg_ocl_init_t			voc_rekey_func;
 	vg_ocl_check_t			voc_check_func;
+	int				voc_quirks;
 	int				voc_nslots;
 	cl_kernel			voc_oclkernel[MAX_SLOT][MAX_KERNEL];
 	cl_event			voc_oclkrnwait[MAX_SLOT];
@@ -200,6 +201,21 @@ vg_ocl_device_getplatform(cl_device_id did)
 			      sizeof(val), &val, &size_ret);
 	if (ret != CL_SUCCESS) {
 		printf("clGetDeviceInfo(CL_DEVICE_PLATFORM): %s",
+		       vg_ocl_strerror(ret));
+	}
+	return val;
+}
+
+cl_device_type
+vg_ocl_device_gettype(cl_device_id did)
+{
+	cl_int ret;
+	cl_device_type val;
+	size_t size_ret;
+	ret = clGetDeviceInfo(did, CL_DEVICE_TYPE,
+			      sizeof(val), &val, &size_ret);
+	if (ret != CL_SUCCESS) {
+		printf("clGetDeviceInfo(CL_DEVICE_TYPE): %s",
 		       vg_ocl_strerror(ret));
 	}
 	return val;
@@ -365,20 +381,56 @@ vg_ocl_buildlog(vg_ocl_context_t *vocp, cl_program prog)
  * OpenCL per-exec functions
  */
 
+enum {
+	VG_OCL_UNROLL_LOOPS         = (1 << 0),
+	VG_OCL_EXPENSIVE_BRANCHES   = (1 << 1),
+	VG_OCL_DEEP_VLIW            = (1 << 2),
+	VG_OCL_NV_VERBOSE           = (1 << 3),
+	VG_OCL_BROKEN               = (1 << 4),
+	VG_OCL_NO_BINARIES          = (1 << 5),
+
+	VG_OCL_OPTIMIZATIONS        = (VG_OCL_UNROLL_LOOPS |
+				       VG_OCL_EXPENSIVE_BRANCHES |
+				       VG_OCL_DEEP_VLIW),
+
+};
+
 int
-vg_ocl_check_driver(vg_ocl_context_t *vocp)
+vg_ocl_get_quirks(vg_ocl_context_t *vocp)
 {
+	const char *vend;
+	unsigned int quirks = 0;
+
+	/* Loop unrolling for devices other than CPUs */
+	if (!(vg_ocl_device_gettype(vocp->voc_ocldid) & CL_DEVICE_TYPE_CPU))
+		quirks |= VG_OCL_UNROLL_LOOPS;
+
+	vend = vg_ocl_device_getstr(vocp->voc_ocldid, CL_DEVICE_VENDOR);
+	if (!strcmp(vend, "NVIDIA Corporation") ||
+	    !strcmp(vend, "NVIDIA")) {
+		quirks |= VG_OCL_NV_VERBOSE;
 #ifdef WIN32
-	if (!strcmp(vg_ocl_device_getstr(vocp->voc_ocldid, CL_DEVICE_VENDOR),
-		    "NVIDIA Corporation") &&
-            strcmp(vg_ocl_device_getstr(vocp->voc_ocldid, CL_DRIVER_VERSION),
-                   "270.81")) {
-		printf("WARNING: Known problems with certain NVIDIA driver versions\n");
-		printf("WARNING: Use version 270.81 for best results\n");
-		return 0;
-	}
+		if (strcmp(vg_ocl_device_getstr(vocp->voc_ocldid,
+						CL_DRIVER_VERSION),
+			   "270.81")) {
+			printf("WARNING: Known problems with certain "
+			       "NVIDIA driver versions\n"
+			       "WARNING: Use version 270.81 "
+			       "for best results\n");
+			quirks |= VG_OCL_BROKEN;
+		}
 #endif
-	return 1;
+	} else if (!strcmp(vend, "Advanced Micro Devices, Inc.") ||
+		   !strcmp(vend, "AMD")) {
+		quirks |= VG_OCL_EXPENSIVE_BRANCHES;
+		quirks |= VG_OCL_DEEP_VLIW;
+		vend = vg_ocl_device_getstr(vocp->voc_ocldid, CL_DEVICE_NAME);
+		if (!strcmp(vend, "ATI RV710")) {
+			quirks &= ~VG_OCL_OPTIMIZATIONS;
+			quirks |= VG_OCL_NO_BINARIES;
+		}
+	}
+	return quirks;
 }
 
 int
@@ -422,8 +474,10 @@ vg_ocl_hash_program(vg_ocl_context_t *vocp, const char *opts,
 	MD5_Update(&ctx, str, strlen(str) + 1);
 	str = vg_ocl_device_getstr(vocp->voc_ocldid, CL_DEVICE_NAME);
 	MD5_Update(&ctx, str, strlen(str) + 1);
-	MD5_Update(&ctx, opts, strlen(opts) + 1);
-	MD5_Update(&ctx, program, size);
+	if (opts)
+		MD5_Update(&ctx, opts, strlen(opts) + 1);
+	if (size)
+		MD5_Update(&ctx, program, size);
 	MD5_Final(hash_out, &ctx);
 }
 
@@ -472,7 +526,14 @@ vg_ocl_load_program(vg_context_t *vcp, vg_ocl_context_t *vocp,
 		 prog_hash[8], prog_hash[9], prog_hash[10], prog_hash[11],
 		 prog_hash[12], prog_hash[13], prog_hash[14], prog_hash[15]);
 
-	kfp = fopen(bin_name, "r");
+	if (vocp->voc_quirks & VG_OCL_NO_BINARIES) {
+		kfp = NULL;
+		if (vcp->vc_verbose > 1)
+			printf("Binary OpenCL programs disabled\n");
+	} else {
+		kfp = fopen(bin_name, "rb");
+	}
+
 	if (!kfp) {
 		/* No binary available, create with source */
 		fromsource = 1;
@@ -481,6 +542,8 @@ vg_ocl_load_program(vg_context_t *vcp, vg_ocl_context_t *vocp,
 						 1, (const char **) &buf, &sz,
 						 &ret);
 	} else {
+		if (vcp->vc_verbose > 1)
+			printf("Loading kernel binary %s\n", bin_name);
 		szr = 0;
 		while (!feof(kfp)) {
 			len = fread(buf + szr, 1, sz - szr, kfp);
@@ -518,13 +581,14 @@ vg_ocl_load_program(vg_context_t *vcp, vg_ocl_context_t *vocp,
 		return 0;
 	}
 
+	if (vcp->vc_verbose > 1)
+		printf("OpenCL compiler flags: %s\n", opts ? opts : "");
+
 	if (vcp->vc_verbose > 0) {
 		if (fromsource) {
 			printf("Compiling kernel...");
 			fflush(stdout);
 		}
-		else if (vcp->vc_verbose > 1)
-			printf("Loading kernel binary %s\n", bin_name);
 	}
 	ret = clBuildProgram(prog, 1, &vocp->voc_ocldid, opts, NULL, NULL);
 	if (ret != CL_SUCCESS) {
@@ -543,7 +607,7 @@ vg_ocl_load_program(vg_context_t *vcp, vg_ocl_context_t *vocp,
 		return 0;
 	}
 
-	if (fromsource) {
+	if (fromsource && !(vocp->voc_quirks & VG_OCL_NO_BINARIES)) {
 		ret = clGetProgramInfo(prog,
 				       CL_PROGRAM_BINARY_SIZES,
 				       sizeof(szr), &szr,
@@ -577,7 +641,7 @@ vg_ocl_load_program(vg_context_t *vcp, vg_ocl_context_t *vocp,
 			goto out;
 		}
 
-		kfp = fopen(bin_name, "w");
+		kfp = fopen(bin_name, "wb");
 		if (!kfp) {
 			printf("WARNING: could not save CL kernel binary: %s\n",
 			       strerror(errno));
@@ -586,8 +650,9 @@ vg_ocl_load_program(vg_context_t *vcp, vg_ocl_context_t *vocp,
 			fclose(kfp);
 			if (sz != szr) {
 				printf("WARNING: short write on CL kernel "
-				       "binary file: %s\n",
-				       strerror(errno));
+				       "binary file: expected "
+				       "%"PRSIZET"d, got %"PRSIZET"d\n",
+				       szr, sz);
 				unlink(bin_name);
 			}
 		}
@@ -616,10 +681,12 @@ vg_ocl_context_callback(const char *errinfo,
 }
 
 int
-vg_ocl_init(vg_context_t *vcp, vg_ocl_context_t *vocp, cl_device_id did)
+vg_ocl_init(vg_context_t *vcp, vg_ocl_context_t *vocp, cl_device_id did,
+	    int safe_mode)
 {
 	cl_int ret;
-	const char *vend, *options;
+	char optbuf[128];
+	int end = 0;
 
 	memset(vocp, 0, sizeof(*vocp));
 	vg_exec_context_init(vcp, &vocp->base);
@@ -633,7 +700,9 @@ vg_ocl_init(vg_context_t *vcp, vg_ocl_context_t *vocp, cl_device_id did)
 	if (vcp->vc_verbose > 1)
 		vg_ocl_dump_info(vocp);
 
-	if (!vg_ocl_check_driver(vocp)) {
+	vocp->voc_quirks = vg_ocl_get_quirks(vocp);
+
+	if ((vocp->voc_quirks & VG_OCL_BROKEN) && (vcp->vc_verbose > 0)) {
 		char yesbuf[16];
 		printf("Type 'yes' to continue: ");
 		fflush(stdout);
@@ -660,21 +729,25 @@ vg_ocl_init(vg_context_t *vcp, vg_ocl_context_t *vocp, cl_device_id did)
 		return 0;
 	}
 
-	options = "-DUNROLL_MAX=16";
+	if (safe_mode)
+		vocp->voc_quirks &= ~VG_OCL_OPTIMIZATIONS;
 
-	vend = vg_ocl_device_getstr(did, CL_DEVICE_VENDOR);
-	if (!strcmp(vend, "Advanced Micro Devices, Inc.") ||
-	    !strcmp(vend, "AMD")) {
-		/* Radeons do better with less flow control */
-		options = "-DUNROLL_MAX=16 -DVERY_EXPENSIVE_BRANCHES";
+	end = 0;
+	optbuf[end] = '\0';
+	if (vocp->voc_quirks & VG_OCL_UNROLL_LOOPS)
+		end += snprintf(optbuf + end, sizeof(optbuf) - end,
+				"-DUNROLL_MAX=16 ");
+	if (vocp->voc_quirks & VG_OCL_EXPENSIVE_BRANCHES)
+		end += snprintf(optbuf + end, sizeof(optbuf) - end,
+				"-DVERY_EXPENSIVE_BRANCHES ");
+	if (vocp->voc_quirks & VG_OCL_DEEP_VLIW)
+		end += snprintf(optbuf + end, sizeof(optbuf) - end,
+				"-DDEEP_VLIW ");
+	if (vocp->voc_quirks & VG_OCL_NV_VERBOSE)
+		end += snprintf(optbuf + end, sizeof(optbuf) - end,
+				"-cl-nv-verbose ");
 
-	} else if (!strcmp(vend, "NVIDIA Corporation")) {
-		/* NVIDIA has a handy verbose output option */
-		if (vcp->vc_verbose > 1)
-			options = "-DUNROLL_MAX=16 -cl-nv-verbose";
-	}
-
-	if (!vg_ocl_load_program(vcp, vocp, "calc_addrs.cl", options))
+	if (!vg_ocl_load_program(vcp, vocp, "calc_addrs.cl", optbuf))
 		return 0;
 	return 1;
 }
@@ -1237,7 +1310,7 @@ vg_ocl_config_pattern(vg_ocl_context_t *vocp)
 	i = vg_context_hash160_sort(vcp, NULL);
 	if (i > 0) {
 		if (vcp->vc_verbose > 1)
-			printf("Using GPU prefix matcher\n");
+			printf("Using OpenCL prefix matcher\n");
 		/* Configure for prefix matching */
 		return vg_ocl_prefix_init(vocp);
 	}
@@ -1335,8 +1408,8 @@ out:
  */
 
 void *
-vg_opencl_loop(vg_context_t *vcp, cl_device_id did, int worksize,
-	       int nrows, int ncols, int invsize)
+vg_opencl_loop(vg_context_t *vcp, cl_device_id did, int safe_mode,
+	       int worksize, int nrows, int ncols, int invsize)
 {
 	int i;
 	int round, full_worksize;
@@ -1363,7 +1436,7 @@ vg_opencl_loop(vg_context_t *vcp, cl_device_id did, int worksize,
 
 	struct timeval tvstart;
 
-	if (!vg_ocl_init(vcp, &ctx, did))
+	if (!vg_ocl_init(vcp, &ctx, did, safe_mode))
 		return NULL;
 
 	pkey = vxcp->vxc_key;
@@ -1403,12 +1476,15 @@ vg_opencl_loop(vg_context_t *vcp, cl_device_id did, int worksize,
 			nrows <<= 1;
 		}
 		/* Increase row & column counts to saturate device memory */
-		while (((ncols * nrows * 2 * 128) < memsize) &&
-		       ((ncols * nrows * 2 * 64) < allocsize)) {
-			if (ncols > nrows)
-				nrows *= 2;
-			else
-				ncols *= 2;
+		if (!(vg_ocl_device_gettype(vocp->voc_ocldid) &
+		      CL_DEVICE_TYPE_CPU)) {
+			while (((ncols * nrows * 2 * 128) < memsize) &&
+			       ((ncols * nrows * 2 * 64) < allocsize)) {
+				if (ncols > nrows)
+					nrows *= 2;
+				else
+					ncols *= 2;
+			}
 		}
 	}
 
@@ -1937,7 +2013,7 @@ usage(const char *name)
 {
 	printf(
 "oclVanitygen %s (" OPENSSL_VERSION_TEXT ")\n"
-"Usage: %s [-vqrikNT] [-t <threads>] [-f <filename>|-] [<pattern>...]\n"
+"Usage: %s [-vqrikNTS] [-d <device>] [-f <filename>|-] [<pattern>...]\n"
 "Generates a bitcoin receiving address matching <pattern>, and outputs the\n"
 "address and associated private key.  The private key may be stored in a safe\n"
 "location or imported into a bitcoin client to spend any balance received on\n"
@@ -1956,6 +2032,7 @@ usage(const char *name)
 "-X <version>  Generate address with the given version\n"
 "-p <platform> Select OpenCL platform\n"
 "-d <device>   Select OpenCL device\n"
+"-S            Safe mode, disable OpenCL loop unrolling optimizations\n"
 "-w <worksize> Set target thread count per multiprocessor\n"
 "-g <x>x<y>    Set grid size\n"
 "-b <invsize>  Set modular inverse ops per thread\n"
@@ -1984,11 +2061,13 @@ main(int argc, char **argv)
 	int nrows = 0, ncols = 0;
 	int invsize = 0;
 	int remove_on_match = 1;
+	int safe_mode = 0;
 	vg_context_t *vcp = NULL;
 	cl_device_id did;
 	const char *result_file = NULL;
 
-	while ((opt = getopt(argc, argv, "vqrikNTX:p:d:w:g:b:h?f:o:s:")) != -1) {
+	while ((opt = getopt(argc, argv,
+			     "vqrikNTX:p:d:w:g:b:Sh?f:o:s:")) != -1) {
 		switch (opt) {
 		case 'v':
 			verbose = 2;
@@ -2053,6 +2132,9 @@ main(int argc, char **argv)
 				       "a power of 2\n");
 				return 1;
 			}
+			break;
+		case 'S':
+			safe_mode = 1;
 			break;
 		case 'f':
 			if (fp) {
@@ -2166,6 +2248,7 @@ main(int argc, char **argv)
 		return 1;
 	}
 
-	vg_opencl_loop(vcp, did, worksize, nrows, ncols, invsize);
+	vg_opencl_loop(vcp, did, safe_mode,
+		       worksize, nrows, ncols, invsize);
 	return 0;
 }
